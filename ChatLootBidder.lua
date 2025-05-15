@@ -131,7 +131,7 @@ local ShowHelp = function()
 	Message("/loot start [itm1] [itm2] [#timer_optional] - Start a session for item(s) + staged items(s)")
 	Message("/loot end - End a loot session and announce winner(s)")
 	Message("/loot sr load [name]  - Load a SR list (by name, optional)")
-	Message("/loot dkp - Send options and current dkp for raid members"
+	Message("/loot dkp - Send options and current dkp for raid members")
 	Message(addonNotes .. " for detailed instructions, bugs, and suggestions")
 	Message("Written by " .. addonAuthor)
 end
@@ -1393,7 +1393,6 @@ function ChatFrame_OnEvent(event)
           return
         end
 
-        -- Получаем текущий DKP игрока (только для DKP режима)
         local playerDkp = nil
         if sessionMode == "DKP" and (tier == "ms" or tier == "os" or tier == "twink") then
             playerDkp = ChatLootBidder:GetPlayerDkpFromGuildNotes(bidder)
@@ -1402,18 +1401,14 @@ function ChatFrame_OnEvent(event)
                 return
             end
         end
-
-        -- Проверяем и корректируем ставку в зависимости от типа
         if sessionMode == "DKP" then
             if tier == "ms" then
-                -- MS: от 0 до полного DKP баланса
                 amt = math.min(amt, playerDkp)
                 if amt < minimumBid then
                     SendResponse("Your bid ("..amt..") is below minimum bid ("..minimumBid..")", bidder)
                     return
                 end
             elseif tier == "os" then
-                -- OS: максимум 50% от DKP баланса
                 local maxOsBid = math.ceil(playerDkp * (ChatLootBidder_Store.MaxOsBid/100))
                 amt = math.min(amt, maxOsBid)
                 if amt < 1 then
@@ -1421,7 +1416,6 @@ function ChatFrame_OnEvent(event)
                     return
                 end
             elseif tier == "twink" then
-                -- TWINK: максимум 30% от DKP баланса
                 local maxTwinkBid = math.ceil(playerDkp * (ChatLootBidder_Store.MaxTwinkBid/100))
                 amt = math.min(amt, maxTwinkBid)
                 if amt < 1 then
@@ -1603,7 +1597,6 @@ function ChatLootBidder.CHAT_MSG_ADDON(addonTag, stringMessage, channel, sender)
     if addonTag == addonName and sender ~= me and IsInRaid(sender) and IsRaidAssistant(sender) and IsRaidAssistant(me) and ChatLootBidder_Store.ListenLootHistory then
         Debug('GOTCHA '..stringMessage..' from '..sender)
         
-        -- Парсим сообщение о луте
         local success, record = pcall(function()
             local parts = {}
             for part in gfind(stringMessage, "([^,]+)") do

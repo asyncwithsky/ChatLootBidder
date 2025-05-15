@@ -132,7 +132,13 @@
         </Anchors>
         <Scripts>
           <OnClick>
-            ChatLootBidderFrame:DecodeAndSave(SrEditFrameText:GetText(), this:GetParent())
+			if SrEditFrameHeaderString:GetText() == "LootHistory" then
+				ChatLootBidderFrame:DecodeLootHistoryAndSave(SrEditFrameText:GetText(), this:GetParent())
+			elseif SrEditFrameHeaderString:GetText() == "ImportDKP" then
+				ChatLootBidderFrame:DecodeImportDkpAndSave(SrEditFrameText:GetText(), this:GetParent())
+			else
+				ChatLootBidderFrame:DecodeAndSave(SrEditFrameText:GetText(), this:GetParent())
+			end
           </OnClick>
         </Scripts>
       </Button>

@@ -33,7 +33,7 @@ local softReserveSessionName = nil
 local softReservesLocked = false
 local session = nil
 local sessionMode = nil
-local stage = nil
+local stage = {}
 local lastWhisper = nil
 
 local function DefaultFalse(prop) return prop == true end
@@ -41,6 +41,7 @@ local function DefaultTrue(prop) return prop == nil or DefaultFalse(prop) end
 
 local function LoadVariables()
   ChatLootBidder_Store = ChatLootBidder_Store or {}
+  ChatLootBidder_LootHistory = ChatLootBidder_LootHistory or {}
   ChatLootBidder_Store.ItemValidation = DefaultTrue(ChatLootBidder_Store.ItemValidation)
   ChatLootBidder_Store.RollAnnounce = DefaultTrue(ChatLootBidder_Store.RollAnnounce)
   ChatLootBidder_Store.AutoStage = DefaultTrue(ChatLootBidder_Store.AutoStage)
@@ -54,6 +55,8 @@ local function LoadVariables()
   ChatLootBidder_Store.MaxBid = ChatLootBidder_Store.MaxBid or 5000
   ChatLootBidder_Store.MinBid = ChatLootBidder_Store.MinBid or 1
   ChatLootBidder_Store.AltPenalty = ChatLootBidder_Store.AltPenalty or 0
+  ChatLootBidder_Store.MaxOsBid = ChatLootBidder_Store.MaxOsBid or 50
+  ChatLootBidder_Store.MaxTwinkBid = ChatLootBidder_Store.MaxTwinkBid or 30
   ChatLootBidder_Store.MinRarity = ChatLootBidder_Store.MinRarity or 4
   ChatLootBidder_Store.MaxRarity = ChatLootBidder_Store.MaxRarity or 5
   ChatLootBidder_Store.DefaultSessionMode = ChatLootBidder_Store.DefaultSessionMode or "MSOS" -- DKP | MSOS
@@ -62,6 +65,7 @@ local function LoadVariables()
   ChatLootBidder_Store.SoftReserveSessions = ChatLootBidder_Store.SoftReserveSessions or {}
   ChatLootBidder_Store.AutoRemoveSrAfterWin = DefaultTrue(ChatLootBidder_Store.AutoRemoveSrAfterWin)
   ChatLootBidder_Store.AutoLockSoftReserve = DefaultTrue(ChatLootBidder_Store.AutoLockSoftReserve)
+  ChatLootBidder_Store.ListenLootHistory = DefaultFalse(ChatLootBidder_Store.ListenLootHistory)
   -- TODO: Make this custom per Soft Reserve session and make this the default when a new list is started
   ChatLootBidder_Store.DefaultMaxSoftReserves = 1
 end
@@ -123,10 +127,11 @@ end
 
 local ShowHelp = function()
 	Message("/loot - Open GUI Options")
-  Message("/loot stage [itm1] [itm2] - Stage item(s) for a future session start")
+	Message("/loot stage [itm1] [itm2] - Stage item(s) for a future session start")
 	Message("/loot start [itm1] [itm2] [#timer_optional] - Start a session for item(s) + staged items(s)")
-  Message("/loot end - End a loot session and announce winner(s)")
-  Message("/loot sr load [name]  - Load a SR list (by name, optional)")
+	Message("/loot end - End a loot session and announce winner(s)")
+	Message("/loot sr load [name]  - Load a SR list (by name, optional)")
+	Message("/loot dkp - Send options and current dkp for raid members"
 	Message(addonNotes .. " for detailed instructions, bugs, and suggestions")
 	Message("Written by " .. addonAuthor)
 end
@@ -170,6 +175,66 @@ local function IsTableEmpty(tbl)
   if tbl == nil then return true end
   local next = next
   return next(tbl) == nil
+end
+
+local function FlattenLootHistory(history)
+    if history == nil then return {} end
+    local flattened = {}
+    
+    for _, record in ipairs(history) do
+        table.insert(flattened, {
+            record.character or "",
+            record.item or "",
+            record.bid_type or "",
+            record.bid_amount or "",
+            record.boss or "",
+            record.datetime or ""
+        })
+    end
+    
+    return flattened
+end
+
+local function UnflattenLootHistory(csvData)
+    local history = {}
+    
+    local fieldIndices = {}
+    local hasHeader = false
+    
+    if getn(csvData) > 0 then
+        local header = csvData[1]
+        if header[1] == "character" and header[2] == "item" then
+            hasHeader = true
+            for i, field in ipairs(header) do
+                fieldIndices[field] = i
+            end
+        else
+            fieldIndices = {
+                character = 1,
+                item = 2,
+                bid_type = 3,
+                bid_amount = 4,
+                boss = 5,
+                datetime = 6
+            }
+        end
+    end
+    
+    local startRow = hasHeader and 2 or 1
+    for i = startRow, getn(csvData) do
+        local row = csvData[i]
+        local record = {
+            character = row[fieldIndices.character or 1],
+            item = row[fieldIndices.item or 2],
+            bid_type = row[fieldIndices.bid_type or 3],
+            bid_amount = tonumber(row[fieldIndices.bid_amount or 4]) or nil,
+            boss = row[fieldIndices.boss or 5] ~= "" and row[fieldIndices.boss or 5] or nil,
+            datetime = row[fieldIndices.datetime or 6]
+        }
+        table.insert(history, record)
+    end
+    
+    return history
 end
 
 -- Flatten a Player: [ SR1, SR2 ] structure into: { [Player, SR1], [Player, SR2] }
@@ -311,7 +376,8 @@ local function AppendNote(note)
 end
 
 local function PlayerWithClassColor(unit)
-  if RAID_CLASS_COLORS and pfUI then -- pfUI loads class colors
+  -- if RAID_CLASS_COLORS and pfUI then -- pfUI loads class colors
+  if RAID_CLASS_COLORS then -- pfUI loads class colors
     local unitClass = GetPlayerClass(unit)
     local colorStr = RAID_CLASS_COLORS[unitClass].colorStr
     if colorStr and string.len(colorStr) == 8 then
@@ -359,150 +425,301 @@ local function realAmt(amt, real)
   return amt
 end
 
+local function AddToLootHistory(winner, item, bidType, bidAmount, bossName)
+    -- Получаем текущую дату и время в формате HH:MM:SS DD/MM/YY
+    local time = date("%H:%M:%S")
+    local dateStr = date("%d/%m/%y")
+    local datetime = time .. " " .. dateStr
+    
+    bossName = bossName or ""
+    
+    local record = {
+        character = winner,
+        item = ParseItemNameFromItemLink(item),
+        bid_type = bidType,
+        bid_amount = bidAmount or nil,
+        boss = bossName,
+        datetime = datetime
+    }
+    
+    table.insert(ChatLootBidder_LootHistory, record)
+	winnerAddonMessage = string.format("%s, %s, %s, %s, %s, %s", 
+        record.character, record.item, record.bid_type, 
+        record.bid_amount or "", record.boss, record.datetime)
+	ChatThrottleLib:SendAddonMessage("BULK", "ChatLootBidder", winnerAddonMessage, "RAID")
+	
+    Debug(string.format("Added to loot history: "..winnerAddonMessage))
+end
+
 local function BidSummary(announceWinners)
-  if session == nil then
-    Error("There is no existing session")
-    return
-  end
-  local summaries = {}
-  for item,itemSession in pairs(session) do
-    local sr = itemSession["sr"] or {}
-    local ms = itemSession["ms"] or {}
-    local ofs = itemSession["os"] or {}
-    local roll = itemSession["roll"]
-    local cancel = itemSession["cancel"] or {}
-    local notes = itemSession["notes"] or {}
-    local real = itemSession["real"] or {}
-    local needsRoll = IsTableEmpty(sr) and IsTableEmpty(ms) and IsTableEmpty(ofs)
-    if announceWinners and needsRoll then
-      for bidder,r in roll do
-        if r == -1 then
-          r = Roll()
-          roll[bidder] = r
-          if ChatLootBidder_Store.RollAnnounce then
-            MessageStartChannel(PlayerWithClassColor(bidder) .. " rolls " .. r .. " (1-100) for " .. item)
-          else
-            SendResponse("You roll " .. r .. " (1-100) for " .. item, bidder)
-          end
+    if session == nil then
+        Error("There is no existing session")
+        return
+    end
+    
+    local summaries = {}
+    for item,itemSession in pairs(session) do
+        local sr = itemSession["sr"] or {}
+        local ms = itemSession["ms"] or {}
+        local ofs = itemSession["os"] or {}
+        local twink = itemSession["twink"] or {}
+        local roll = itemSession["roll"] or {}
+        local cancel = itemSession["cancel"] or {}
+        local notes = itemSession["notes"] or {}
+        local real = itemSession["real"] or {}
+
+        local allBids = {}
+        
+        for bidder,bid in pairs(ms) do
+            if cancel[bidder] == nil then
+                allBids[bidder] = {value = bid, tier = "ms", priority = 3, real = real[bidder]}
+            end
         end
-      end
-    end
-    local winner = {}
-    local winnerBid = nil
-    local winnerTier = nil
-    local header = true
-    local summary = {}
-    if not IsTableEmpty(sr) then
-      local sortedMainspecKeys = GetKeysSortedByValue(sr)
-      for k,bidder in pairs(sortedMainspecKeys) do
-        if IsTableEmpty(winner) then table.insert(summary, item) end
-        if header then table.insert(summary, "- Soft Reserve:"); header = false end
-        local bid = sr[bidder]
-        if IsTableEmpty(winner) then table.insert(winner, bidder); winnerBid = bid; winnerTier = "sr"
-        elseif not IsTableEmpty(winner) and winnerTier == "sr" and winnerBid == bid then table.insert(winner, bidder) end
-        table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. bid)
-      end
-    end
-    header = true
-    if not IsTableEmpty(ms) then
-      local sortedMainspecKeys = GetKeysSortedByValue(ms)
-      for k,bidder in pairs(sortedMainspecKeys) do
-        if cancel[bidder] == nil then
-          if IsTableEmpty(winner) then table.insert(summary, item) end
-          if header then table.insert(summary, "- Main Spec:"); header = false end
-          local bid = ms[bidder]
-          if IsTableEmpty(winner) then table.insert(winner, bidder); winnerBid = bid; winnerTier = "ms"
-          elseif not IsTableEmpty(winner) and winnerTier == "ms" and winnerBid == bid then table.insert(winner, bidder) end
-          table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. realAmt(bid, real[bidder]) .. AppendNote(notes[bidder]))
+        
+        for bidder,bid in pairs(ofs) do
+            if cancel[bidder] == nil then
+                allBids[bidder] = {value = bid, tier = "os", priority = 3, real = real[bidder]}
+            end
         end
-      end
-    end
-    header = true
-    if not IsTableEmpty(ofs) then
-      local sortedOffspecKeys = GetKeysSortedByValue(ofs)
-      for k,bidder in pairs(sortedOffspecKeys) do
-        if cancel[bidder] == nil and ms[bidder] == nil then
-          if IsTableEmpty(winner) then table.insert(summary, item) end
-          if header then table.insert(summary, "- Off Spec:"); header = false end
-          local bid = ofs[bidder]
-          if IsTableEmpty(winner) then table.insert(winner, bidder); winnerBid = bid; winnerTier = "os"
-          elseif not IsTableEmpty(winner) and winnerTier == "os" and winnerBid == bid then table.insert(winner, bidder) end
-          table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. realAmt(bid, real[bidder]) .. AppendNote(notes[bidder]))
+        
+        for bidder,bid in pairs(twink) do
+            if cancel[bidder] == nil then
+                allBids[bidder] = {value = bid, tier = "twink", priority = 3, real = real[bidder]}
+            end
         end
-      end
-    end
-    header = true
-    if not IsTableEmpty(roll) then
-      local sortedRollKeys = GetKeysSortedByValue(roll)
-      for k,bidder in pairs(sortedRollKeys) do
-        if cancel[bidder] == nil and ms[bidder] == nil and ofs[bidder] == nil then
-          if IsTableEmpty(winner) then table.insert(summary, item) end
-          if header then table.insert(summary, "- Rolls:"); header = false end
-          local bid = roll[bidder]
-          if IsTableEmpty(winner) then table.insert(winner, bidder); winnerBid = bid; winnerTier = "roll"
-          elseif not IsTableEmpty(winner) and winnerTier == "roll" and winnerBid == bid then table.insert(winner, bidder) end
-          table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. bid .. AppendNote(notes[bidder]))
+        
+        if IsTableEmpty(ms) and IsTableEmpty(ofs) and IsTableEmpty(twink) then
+            for bidder,bid in pairs(sr) do
+                allBids[bidder] = {value = 1, tier = "sr", priority = 0}
+            end
         end
-      end
-    end
-    local breakTies = ChatLootBidder_Store.BreakTies or sessionMode ~= "DKP"
-    if getn(winner) > 1 then
-      if sessionMode == "DKP" then
-        MessageWinnerChannel(table.concat(winner, ", ") .. " tied with a ".. string.upper(winnerTier) .. " bid of " .. winnerBid .. ", rolling it off:")
-      else
-        MessageWinnerChannel(table.concat(winner, ", ") .. " bid ".. string.upper(winnerTier) ..", rolling it off:")
-      end
-      while getn(winner) > 1 and breakTies do
-        local winningRoll = 0
-        for _,bidder in winner do
-          local r = roll[bidder]
-          if r == -1 or r == nil then
-            r = Roll()
-            roll[bidder] = r
-            MessageWinnerChannel(PlayerWithClassColor(bidder) .. " rolls " .. r .. " (1-100) for " .. item)
-          else
-            r = roll[bidder]
-            MessageWinnerChannel(PlayerWithClassColor(bidder) .. " already rolled " .. r .. " (1-100) for " .. item)
-          end
-          if winningRoll < r then winningRoll = r end
+        
+        if IsTableEmpty(ms) and IsTableEmpty(ofs) and IsTableEmpty(twink) and IsTableEmpty(sr) then
+            for bidder,bid in pairs(roll) do
+                if cancel[bidder] == nil then
+                    if bid == -1 then
+                        bid = Roll()
+                        roll[bidder] = bid
+                        if ChatLootBidder_Store.RollAnnounce then
+                            MessageStartChannel(PlayerWithClassColor(bidder) .. " rolls " .. bid .. " (1-100) for " .. item)
+                        else
+                            SendResponse("You roll " .. bid .. " (1-100) for " .. item, bidder)
+                        end
+                    end
+                    allBids[bidder] = {value = bid, tier = "roll", priority = -1}
+                end
+            end
         end
-        local newWinner = {}
-        for _,bidder in winner do
-          if roll[bidder] == winningRoll then
-            table.insert(newWinner, bidder)
-          end
-          roll[bidder] = -1
+        
+        local sortedBidders = {}
+        for bidder,_ in pairs(allBids) do
+            table.insert(sortedBidders, bidder)
         end
-        winner = newWinner
-      end
-    end
-    if IsTableEmpty(winner) then
-      if announceWinners then MessageStartChannel("No bids received for " .. item) end
-      table.insert(summary, item .. ": No Bids")
-    elseif announceWinners then
-      local winnerMessage = table.concat(winner, ", ") .. (getn(winner) > 1 and " tie for " or " wins ") .. item
-      if sessionMode == "DKP" then
-        winnerMessage = winnerMessage .. " with a " .. (winnerTier == "roll" and "roll of " or (string.upper(winnerTier) .. " bid of "))
-        if getn(winner) == 1 and winnerTier ~= "roll" then
-          winnerMessage = winnerMessage .. realAmt(winnerBid, real[winner[1]])
-        else
-          winnerMessage = winnerMessage .. winnerBid
+        
+        table.sort(sortedBidders, function(a,b)
+            local bidA = allBids[a]
+            local bidB = allBids[b]
+            if bidA.priority ~= bidB.priority then
+                return bidA.priority > bidB.priority
+            end
+            return bidA.value > bidB.value
+        end)
+        
+        local winners = {}
+        local winningBid = nil
+        local winningTier = nil
+        
+        if getn(sortedBidders) > 0 then
+            winningBid = allBids[sortedBidders[1]].value
+            winningTier = allBids[sortedBidders[1]].tier
+
+            for i = 1, getn(sortedBidders) do
+                local bidder = sortedBidders[i]
+                local bid = allBids[bidder]
+                if bid.priority == allBids[sortedBidders[1]].priority and bid.value == winningBid then
+                    table.insert(winners, bidder)
+                else
+                    break
+                end
+            end
         end
-      else
-        winnerMessage = winnerMessage .. " for " .. string.upper(winnerTier)
-      end
-      MessageWinnerChannel(winnerMessage)
+        
+        local header = true
+        local summary = {}
+		local sortedMainspecKeys = GetKeysSortedByValue(ms)
+		if not IsTableEmpty(ms) and header then 
+			table.insert(summary, "- Main Spec:")
+		end
+		for _,bidder in ipairs(sortedMainspecKeys) do
+			if cancel[bidder] == nil then
+				local bid = ms[bidder]
+				table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. realAmt(bid, real[bidder]) .. AppendNote(notes[bidder]))
+			end
+		end
+		if not IsTableEmpty(ofs) and header then 
+			table.insert(summary, "- Off Spec:")
+		end
+		local sortedOffspecKeys = GetKeysSortedByValue(ofs)
+		for _,bidder in ipairs(sortedOffspecKeys) do
+			if cancel[bidder] == nil then
+				local bid = ofs[bidder]
+				table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. realAmt(bid, real[bidder]) .. AppendNote(notes[bidder]))
+			end
+		end
+        
+		if not IsTableEmpty(twink) and header then 
+			table.insert(summary, "- Twink:")
+		end
+		local sortedTwinkKeys = GetKeysSortedByValue(twink)
+		for _,bidder in ipairs(sortedTwinkKeys) do
+			if cancel[bidder] == nil then
+				local bid = twink[bidder]
+				table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. realAmt(bid, real[bidder]) .. AppendNote(notes[bidder]))
+			end
+		end
+        
+		if not IsTableEmpty(sr) and header then 
+			table.insert(summary, "- Soft Reserve:")
+		end
+        if not IsTableEmpty(sr) and IsTableEmpty(ms) and IsTableEmpty(ofs) and IsTableEmpty(twink) then
+            local sortedSrKeys = GetKeysSortedByValue(sr)
+            for _,bidder in ipairs(sortedSrKeys) do
+                table.insert(summary, "-- " .. PlayerWithClassColor(bidder))
+            end
+        end
+        
+        if not IsTableEmpty(roll) and IsTableEmpty(ms) and IsTableEmpty(ofs) and IsTableEmpty(twink) and IsTableEmpty(sr) then
+            local sortedRollKeys = GetKeysSortedByValue(roll)
+			if header then 
+				table.insert(summary, "- Rolls:")
+			end
+            for _,bidder in ipairs(sortedRollKeys) do
+                if cancel[bidder] == nil then
+                    local bid = roll[bidder]
+                    table.insert(summary, "-- " .. PlayerWithClassColor(bidder) .. ": " .. bid .. AppendNote(notes[bidder]))
+                end
+            end
+        end
+        
+
+        local breakTies = ChatLootBidder_Store.BreakTies or sessionMode ~= "DKP"
+        if getn(winners) > 1 and breakTies then
+            MessageWinnerChannel(table.concat(winners, ", ") .. " tied with " .. 
+                              (winningTier == "roll" and "roll of " or (string.upper(winningTier) .. " bid of ")) .. 
+                              winningBid .. ", rolling it off:")
+            
+            local newWinners = {}
+            local winningRoll = 0
+            
+            for _, bidder in ipairs(winners) do
+                local r = roll[bidder]
+                if r == -1 or r == nil then
+                    r = Roll()
+                    roll[bidder] = r
+                    MessageWinnerChannel(PlayerWithClassColor(bidder) .. " rolls " .. r .. " (1-100) for " .. item)
+                else
+                    MessageWinnerChannel(PlayerWithClassColor(bidder) .. " already rolled " .. r .. " (1-100) for " .. item)
+                end
+                
+                if r > winningRoll then
+                    winningRoll = r
+                    newWinners = {bidder}
+                elseif r == winningRoll then
+                    table.insert(newWinners, bidder)
+                end
+            end
+            
+            winners = newWinners
+            
+            while getn(winners) > 1 do
+                MessageWinnerChannel(table.concat(winners, ", ") .. " tied with roll of " .. winningRoll .. ", rolling again:")
+                
+                winningRoll = 0
+                local tempWinners = {}
+                
+                for _, bidder in ipairs(winners) do
+                    local r = Roll()
+                    roll[bidder] = r
+                    MessageWinnerChannel(PlayerWithClassColor(bidder) .. " rolls " .. r .. " (1-100) for " .. item)
+                    
+                    if r > winningRoll then
+                        winningRoll = r
+                        tempWinners = {bidder}
+                    elseif r == winningRoll then
+                        table.insert(tempWinners, bidder)
+                    end
+                end
+                
+                winners = tempWinners
+            end
+        end
+        
+
+        if getn(winners) == 0 then
+            if announceWinners then MessageStartChannel("No bids received for " .. item) end
+        elseif announceWinners then
+            local winnerMessage
+            if getn(winners) > 1 then
+                winnerMessage = table.concat(winners, ", ") .. " tie for " .. item
+            else
+                winnerMessage = winners[1] .. " wins " .. item
+            end
+            
+            if sessionMode == "DKP" then
+                winnerMessage = winnerMessage .. " with " .. (winningTier == "roll" and "roll of " or (string.upper(winningTier) .. " bid of "))
+                if getn(winners) == 1 and winningTier ~= "roll" then
+                    winnerMessage = winnerMessage .. realAmt(winningBid, allBids[winners[1]].real)
+                else
+                    winnerMessage = winnerMessage .. winningBid
+                end
+                
+
+                if winningTier ~= "roll" and winningTier ~= "sr" then
+                    for _, winner in ipairs(winners) do
+                        local dkpToDeduct = allBids[winner].real or winningBid
+                        local currentDkp = ChatLootBidder:GetPlayerDkpFromGuildNotes(winner)
+                        if currentDkp then
+                            local newDkp = currentDkp - dkpToDeduct
+                            ChatLootBidder:UpdatePlayerDkpInGuildNotes(winner, newDkp)
+                            Debug(string.format("Deducted %d DKP from %s (new balance: %d)", 
+                                dkpToDeduct, winner, newDkp))
+                        else
+                            Debug(string.format("Could not find DKP balance for %s", winner))
+                        end
+                    end
+                end
+            else
+                winnerMessage = winnerMessage .. " (" .. string.upper(winningTier) .. ")"
+            end
+            
+            MessageWinnerChannel(winnerMessage)
+            
+            for _, winner in ipairs(winners) do
+                local bidType = (winningTier == "ms" or winningTier == "os" or winningTier == "twink") and "dkp" or winningTier
+                local bidAmount = (bidType == "dkp") and winningBid or nil
+                local bossName = ''
+                
+                if ChatLootBidder:MasterLootRemindLoaded() and MasterLootRemind._bossName ~= '_NONE_' then
+                    bossName = MasterLootRemind._bossName
+                    Debug('MasterLootRemind loaded, last boss name is '..bossName)
+                end
+                
+                AddToLootHistory(winner, item, bidType, bidAmount, bossName)
+            end
+        end
+        
+        table.insert(summaries, summary)
+        
+        if winningTier == "sr" and ChatLootBidder_Store.AutoRemoveSrAfterWin and getn(winners) == 1 then
+            HandleSrRemove(winners[1], item)
+        end
     end
-    table.insert(summaries, summary)
-    if winnerTier == "sr" and ChatLootBidder_Store.AutoRemoveSrAfterWin then
-      HandleSrRemove(winner[1], item)
+    
+    for _, summary in ipairs(summaries) do
+        for _, line in ipairs(summary) do
+            MessageBidSummaryChannel(line)
+        end
     end
-  end
-  for _,summary in summaries do
-    for _,line in summary do
-      MessageBidSummaryChannel(line)
-    end
-  end
 end
 
 function ChatLootBidder:End()
@@ -510,9 +727,13 @@ function ChatLootBidder:End()
   BidSummary(true)
   session = nil
   sessionMode = nil
-  stage = nil
+  -- stage = nil
+  if getn(stage) > 0 then
+  else
+	 ChatLootBidder:Hide()
+  end
   endSessionButton:Hide()
-  ChatLootBidder:Hide()
+  ChatLootBidder:RedrawStage()
 end
 
 local function GetItemLinks(str)
@@ -528,77 +749,103 @@ local function GetItemLinks(str)
   end
 end
 
-function ChatLootBidder:Start(items, timer, mode)
-  if not IsRaidAssistant(me) then Error("You must be a raid leader or assistant in a raid to start a loot session"); return end
-  if not IsMasterLooterSet() then Error("Master Looter must be set to start a loot session"); return end
-  local mode = mode ~= nil and mode or ChatLootBidder_Store.DefaultSessionMode
-  if session ~= nil then ChatLootBidder:End() end
-  local stageList = GetKeysWhere(stage, function(k,v) return v == true end)
-  if items == nil then
-    items = stageList
-  else
-    for _, v in pairs(stageList) do
-      table.insert(items, v)
-    end
-  end
-  if IsTableEmpty(items) then Error("You must provide at least a single item to bid on"); return end
-  ChatLootBidder:EndSessionButtonShown()
-  session = {}
-  sessionMode = mode
-  stage = nil
-  if ChatLootBidder_Store.AutoLockSoftReserve and softReserveSessionName ~= nil and not softReservesLocked then
-    softReservesLocked = true
-    MessageStartChannel("Soft Reserves for " .. softReserveSessionName .. " are now LOCKED")
-  end
-  local srs = mode == "MSOS" and softReserveSessionName ~= nil and ChatLootBidder_Store.SoftReserveSessions[softReserveSessionName] or {}
-  local startChannelMessage = {}
-  table.insert(startChannelMessage, "Bid on the following items")
-  table.insert(startChannelMessage, "-----------")
-  local bidAddonMessage = "mode=" .. mode .. ",items="
-  local exampleItem
-  for k,i in pairs(items) do
-    local itemName = ParseItemNameFromItemLink(i)
-    local srsOnItem = GetKeysWhere(srs, function(player, playerSrs) return IsInRaid(player) and TableContains(playerSrs, itemName) end)
-    local srLen = TableLength(srsOnItem)
-    session[i] = {}
-    session[i]["cancel"] = {}
-    session[i]["roll"] = {}
-    session[i]["real"] = {}
-    if srLen == 0 then
-      exampleItem = i
-      table.insert(startChannelMessage, i)
-      bidAddonMessage = bidAddonMessage .. string.gsub(i, ",", "~~~")
-      session[i]["ms"] = {}
-      session[i]["os"] = {}
-      session[i]["notes"] = {}
-    else
-      table.insert(startChannelMessage, i .. " SR (" .. srLen .. ")")
-      session[i]["sr"] = {}
-      for _,sr in pairs(srsOnItem) do
-        session[i]["sr"][sr] = 1
-        session[i]["roll"][sr] = -1
-        if srLen > 1 then
-          SendResponse("Your Soft Reserve for " .. i .. " is contested by " .. (srLen-1) .. " other player" .. (srLen == 2 and "" or "s") .. ". '/random' now to record your own roll or do nothing for the addon to roll for you at the end of the session.", sr)
-        else
-          SendResponse("You won " .. i .. " with your Soft Reserve!", srsOnItem[1])
+function ChatLootBidder:Start(items, minBid, mode)
+    if not IsRaidAssistant(me) then Error("You must be a raid leader or assistant in a raid to start a loot session"); return end
+    if not IsMasterLooterSet() then Error("Master Looter must be set to start a loot session"); return end
+    
+    local mode = mode ~= nil and mode or ChatLootBidder_Store.DefaultSessionMode
+    if session ~= nil then ChatLootBidder:End() end
+
+	if getn(stage) == 0 then
+		ChatLootBidder:SetHeight(100)
+	end
+	
+    local stagedItem = nil
+    for k, v in pairs(stage) do
+        if v == true then
+            stagedItem = k
+            stage[k] = nil
+            break
         end
-      end
     end
-  end
-  table.insert(startChannelMessage, "-----------")
-  if exampleItem then
-    table.insert(startChannelMessage, "/w " .. PlayerWithClassColor(me) .. " " .. exampleItem .. " ms/os/roll" .. (mode == "DKP" and " #bid" or "") .. " [optional-note]")
-    local l
-    for _, l in pairs(startChannelMessage) do
-      MessageStartChannel(l)
+    
+    if items == nil then
+        items = stagedItem and {stagedItem} or {}
+    elseif stagedItem then
+        table.insert(items, 1, stagedItem)
     end
-    if timer == nil or timer < 0 then timer = ChatLootBidder_Store.TimerSeconds end
-    if BigWigs and timer > 0 then BWCB(timer, "Bidding Ends") end
-    ChatThrottleLib:SendAddonMessage("BULK", "NotChatLootBidder", bidAddonMessage, "RAID")
-  else
-    -- Everything was SR'd - just end now
-    ChatLootBidder:End()
-  end
+    
+    if IsTableEmpty(items) then Error("You must provide at least a single item to bid on"); return end
+    ChatLootBidder:RedrawStage()
+    ChatLootBidder:EndSessionButtonShown()
+    session = {}
+    sessionMode = mode
+    
+    if ChatLootBidder_Store.AutoLockSoftReserve and softReserveSessionName ~= nil and not softReservesLocked then
+        softReservesLocked = true
+        MessageStartChannel("Soft Reserves for " .. softReserveSessionName .. " are now LOCKED")
+    end
+    
+    local srs = mode == "MSOS" and softReserveSessionName ~= nil and ChatLootBidder_Store.SoftReserveSessions[softReserveSessionName] or {}
+    local startChannelMessage = {}
+    table.insert(startChannelMessage, "Bid on the following items")
+    table.insert(startChannelMessage, "-----------")
+    
+    local minimumBid = (minBid ~= nil and tostring(minBid)) or tostring(ChatLootBidder_Store.MinBid)
+    local bidAddonMessage = "mode=" .. mode ..",minimumBid="..minimumBid..",MaxOsBid=".. tostring(ChatLootBidder_Store.MaxOsBid)..",MaxTwinkBid=".. tostring(ChatLootBidder_Store.MaxTwinkBid)..",items="
+    local exampleItem
+    
+    for k, i in pairs(items) do
+        local itemName = ParseItemNameFromItemLink(i)
+        local srsOnItem = GetKeysWhere(srs, function(player, playerSrs) return IsInRaid(player) and TableContains(playerSrs, itemName) end)
+        local srLen = TableLength(srsOnItem)
+        
+        session[i] = {
+            cancel = {},
+            roll = {},
+            real = {},
+            minBid = minimumBid,
+            notes = {}
+        }
+        
+        if srLen == 0 then
+            exampleItem = i
+            table.insert(startChannelMessage, i)
+            bidAddonMessage = bidAddonMessage .. string.gsub(i, ",", "~~~")
+            session[i]["ms"] = {}
+            session[i]["os"] = {}
+            session[i]["twink"] = {}
+        else
+            table.insert(startChannelMessage, i .. " SR (" .. srLen .. ")")
+            session[i]["sr"] = {}
+            for _, sr in pairs(srsOnItem) do
+                session[i]["sr"][sr] = 1
+                session[i]["roll"][sr] = -1
+                if srLen > 1 then
+                    SendResponse("Your Soft Reserve for " .. i .. " is contested by " .. (srLen-1) .. " other player" .. (srLen == 2 and "" or "s") .. ". '/random' now to record your own roll or do nothing for the addon to roll for you at the end of the session.", sr)
+                else
+                    SendResponse("You won " .. i .. " with your Soft Reserve!", srsOnItem[1])
+                end
+            end
+        end
+    end
+    
+    table.insert(startChannelMessage, "-----------")
+    
+    if exampleItem then
+        table.insert(startChannelMessage, "/w " .. PlayerWithClassColor(me) .. " " .. exampleItem .. " ms/os/twink/roll" .. (mode == "DKP" and " #bid (minBid: "..minimumBid..")" or "") .. " [optional-note]")
+        
+        for _, l in pairs(startChannelMessage) do
+            MessageStartChannel(l)
+        end
+        
+        timer = ChatLootBidder_Store.TimerSeconds
+        if BigWigs and timer > 0 then BWCB(timer, "Bidding Ends") end
+        ChatThrottleLib:SendAddonMessage("BULK", "NotChatLootBidder", bidAddonMessage, "RAID")
+    else
+        -- Everything was SR'd - just end now
+        ChatLootBidder:End()
+    end
 end
 
 function ChatLootBidder:Clear(stageOnly)
@@ -775,6 +1022,60 @@ function ChatLootBidder:HandleEncoding(encodingType)
   end
 end
 
+function ChatLootBidder:HandleShowLootHistory()
+	local encoded = csv:toCSV(FlattenLootHistory(ChatLootBidder_LootHistory))
+	if not SrEditFrame:IsVisible() then
+	  SrEditFrame:Show()
+	elseif SrEditFrameHeaderString:GetText() == 'LootHistory' then
+	  SrEditFrame:Hide()
+	end
+	SrEditFrameText:SetText(encoded)
+	SrEditFrameHeaderString:SetText('LootHistory')
+end
+
+function ChatLootBidder:HandleShowImportDKP()
+	if not SrEditFrame:IsVisible() then
+	  SrEditFrame:Show()
+	elseif SrEditFrameHeaderString:GetText() == 'ImportDKP' then
+	  SrEditFrame:Hide()
+	end
+	SrEditFrameText:SetText('')
+	SrEditFrameHeaderString:SetText('ImportDKP')
+end
+
+function ChatLootBidder:HandleShowPlayers()
+    local raidMembers = {}
+    
+    if IsInRaid(me) then
+        for i = 1, GetNumRaidMembers() do
+            local name, _, _, _, _, _, _, _, _, _, _ = GetRaidRosterInfo(i)
+            if name then
+                table.insert(raidMembers, name)
+            end
+        end
+    else
+        table.insert(raidMembers, UnitName("player"))
+    end
+    table.sort(raidMembers, function(a, b)
+        return a < b
+    end)
+    
+    local playerText = ""
+    for i, name in ipairs(raidMembers) do
+        playerText = playerText .. name .. "\n"
+    end
+    
+    if not SrEditFrame:IsVisible() then
+        SrEditFrame:Show()
+    elseif SrEditFrameHeaderString:GetText() == 'Players' then
+        SrEditFrame:Hide()
+        return
+    end
+    
+    SrEditFrameText:SetText(playerText)
+    SrEditFrameHeaderString:SetText('Players')
+end
+
 function ChatLootBidder:ToggleSrLock(command)
   if softReserveSessionName == nil then
     Error("No Soft Reserve session loaded")
@@ -862,9 +1163,36 @@ local InitSlashCommands = function()
       BidSummary()
     elseif commandlist[1] == "start" then
       local itemLinks = GetItemLinks(message)
-      local optionalTimer = ToWholeNumber(commandlist[getn(commandlist)], -1)
-      ChatLootBidder:Start(itemLinks, optionalTimer)
+      local minBidOptional = ToWholeNumber(commandlist[getn(commandlist)], 1)
+      ChatLootBidder:Start(itemLinks, minBidOptional)
+	elseif commandlist[1] == "history" then
+		ChatLootBidder:PrintLootHistory()
+	elseif commandlist[1] == "clearhistory" then
+		ChatLootBidder:ClearLootHistory()
+	elseif commandlist[1] == "listen" then
+		ChatLootBidder_Store.ListenLootHistory = not ChatLootBidder_Store.ListenLootHistory
+		Message('Setting listen history to '..tostring(ChatLootBidder_Store.ListenLootHistory))
+	elseif commandlist[1] == "dkp" then
+		local bidAddonMessage = "checkDkp=1,MaxOsBid=".. tostring(ChatLootBidder_Store.MaxOsBid)..",MaxTwinkBid=".. tostring(ChatLootBidder_Store.MaxTwinkBid)
+		ChatThrottleLib:SendAddonMessage("BULK", "NotChatLootBidder", bidAddonMessage, "RAID")
+	else
+		-- Stolen logic from SOTA dkp addon (https://github.com/Sentilix/sota)
+		sign = string.sub(commandlist[1], 1, 1);
+		local number
+		if sign == "+" then
+			number = tonumber(string.sub(commandlist[1], 2))
+			--	Command: +
+			--	Syntax: "+<%d> <playername>"
+			Debug('Add: '..tostring(number)..' to '..commandlist[2])
+			ChatLootBidder:ApplyDKP(commandlist[2], number, false)
+		elseif sign == "-" then
+			number =  tonumber(string.sub(commandlist[1], 2))
+			--	Command: -
+			--	Syntax: "-<%d> <playername>"
+			Debug('Subtract: '..tostring(number)..' from '..commandlist[2])
+			ChatLootBidder:ApplyDKP(commandlist[2], -1*number, false)
 		end
+	end
   end
 end
 
@@ -896,12 +1224,12 @@ local function LoadValues()
 end
 
 local function IsValidTier(tier)
-  return tier == "ms" or tier == "os" or tier == "roll" or tier == "cancel"
+  return tier == "ms" or tier == "os" or tier == "twink" or tier == "roll" or tier == "cancel"
 end
 
 local function InvalidBidSyntax(item)
   local bidExample = " " .. (ChatLootBidder_Store.MinBid + 9)
-  return "Invalid bid syntax for " .. item .. ".  The proper format is: '[item-link] ms" .. (sessionMode == "DKP" and bidExample or "") .. "' or '[item-link] os" .. (sessionMode == "DKP" and bidExample or "") .. "' or '[item-link] roll'"
+  return "Invalid bid syntax for " .. item .. ".  The proper format is: '[item-link] ms" .. (sessionMode == "DKP" and bidExample or "") .. "' or '[item-link] os" .. (sessionMode == "DKP" and bidExample or "") .. "' or '[item-link] twink" .. (sessionMode == "DKP" and bidExample or "") .. "' or '[item-link] roll'"
 end
 
 local function of(amt, real)
@@ -922,6 +1250,10 @@ end
 
 local function AtlasLootLoaded()
   return (AtlasLoot_Data and AtlasLoot_Data["AtlasLootItems"]) ~= nil
+end
+
+function ChatLootBidder:MasterLootRemindLoaded()
+  return (MasterLootRemind and MasterLootRemind._bossName) ~= nil
 end
 
 -- Ex/
@@ -971,148 +1303,200 @@ local function HandleSrAdd(bidder, itemName)
 end
 
 function ChatFrame_OnEvent(event)
-  -- Non-whispers are ignored; Don't react to duplicate whispers (multiple windows, usually)
-  if event ~= "CHAT_MSG_WHISPER" or lastWhisper == (arg1 .. arg2) then
-    ChatLootBidder_ChatFrame_OnEvent(event)
-    return
-  end
-  lastWhisper = arg1 .. arg2
-  local bidder = arg2
-
-  -- Parse string for a item links
-  local items, itemIndexEnd = GetItemLinks(arg1)
-  local item = items[1]
-
-  -- Handle SR Bids
-  local commandlist = SplitBySpace(arg1)
-  if (softReserveSessionName ~= nil and string.lower(commandlist[1] or "") == "sr") then
-    if not IsInRaid(bidder) then
-      SendResponse("You must be in the raid to place a Soft Reserve", bidder)
-      return
-    end
-    if softReserveSessionName == nil then
-      SendResponse("There is no Soft Reserve session loaded", bidder)
-      return
-    end
-    -- If we're manually editing the SRs, treat it like being locked for incoming additions
-    local softReservesLocked = softReservesLocked or SrEditFrame:IsVisible()
-    if TableLength(commandlist) == 1 or softReservesLocked then
-      -- skip, query do the query at the end
-    elseif commandlist[2] == "clear" or commandlist[2] == "delete" or commandlist[2] == "remove" then
-      Srs(softReserveSessionName)[bidder] = nil
-    elseif item ~= nil then
-      local _i
-      for _,_i in pairs(items) do
-        HandleSrAdd(bidder, ParseItemNameFromItemLink(_i))
-      end
-    else
-      table.remove(commandlist, 1)
-      HandleSrAdd(bidder, table.concat(commandlist, " "))
-    end
-    HandleSrQuery(bidder)
-  -- Ignore all other whispers unless there is an active loot session and there is an item link in the whisper
-  elseif session ~= nil and item ~= nil then
-    local itemSession = session[item]
-    if itemSession == nil then
-      local invalidBid = "There is no active loot session for " .. item
-      SendResponse(invalidBid, bidder)
-      return
-    end
-    if not IsInRaid(arg2) then
-      local invalidBid = "You must be in the raid to send a bid on " .. item
-      SendResponse(invalidBid, bidder)
-      return
-    end
-    local mainSpec = itemSession["ms"]
-    local offSpec = itemSession["os"]
-    local roll = itemSession["roll"]
-    local cancel = itemSession["cancel"]
-    local notes = itemSession["notes"]
-    local real = itemSession["real"]
-
-    local bid = SplitBySpace(string.sub(arg1, itemIndexEnd + 1))
-    local tier = bid[1] and string.lower(bid[1]) or nil
-    local amt = bid[2] and string.lower(bid[2]) or nil
-
-    if IsValidTier(tier) then
-      amt = ToWholeNumber(amt)
-    elseif IsValidTier(amt) then
-      -- The bidder mixed up the ms ## to ## ms, handle the mixup
-      local oldTier = tier
-      tier = amt;
-      amt = ToWholeNumber(oldTier)
-    else
-      SendResponse(InvalidBidSyntax(item), bidder)
-      return
-    end
-    if tier == "cancel" then
-      local cancelBid = "Bid canceled for " .. item
-      cancel[bidder] = true
-      mainSpec[bidder] = nil
-      offSpec[bidder] = nil
-      notes[bidder] = nil
-      real[bidder] = nil
-      MessageBidChannel("<" .. PlayerWithClassColor(bidder) .. "> " .. cancelBid)
-      SendResponse(cancelBid, bidder)
-      return
-    end
-    if amt > ChatLootBidder_Store.MaxBid then
-      local invalidBid = "Bid for " .. item .. " is too large, the maxiumum accepted bid is: " .. ChatLootBidder_Store.MaxBid
-      SendResponse(invalidBid, bidder)
-      return
-    end
-    -- If they had previously canceled, remove them and allow the new bid to continue
-    cancel[bidder] = nil
-    if tier == "roll" then
-      if roll[bidder] ~= nil and roll[bidder] ~= -1 then
-        SendResponse("Your roll of " .. roll[bidder] .. " has already been recorded", bidder)
+    -- Non-whispers are ignored; Don't react to duplicate whispers (multiple windows, usually)
+    if event ~= "CHAT_MSG_WHISPER" or lastWhisper == (arg1 .. arg2) then
+        ChatLootBidder_ChatFrame_OnEvent(event)
         return
-      end
-    elseif sessionMode == "DKP" then
-      if amt < ChatLootBidder_Store.MinBid then
-        SendResponse(InvalidBidSyntax(item), bidder)
+    end
+    lastWhisper = arg1 .. arg2
+    local bidder = arg2
+
+    -- Parse string for a item links
+    local items, itemIndexEnd = GetItemLinks(arg1)
+    local item = items[1]
+
+    -- Handle SR Bids
+    local commandlist = SplitBySpace(arg1)
+    if (softReserveSessionName ~= nil and string.lower(commandlist[1] or "") == "sr") then
+		if not IsInRaid(bidder) then
+		  SendResponse("You must be in the raid to place a Soft Reserve", bidder)
+		  return
+		end
+		if softReserveSessionName == nil then
+		  SendResponse("There is no Soft Reserve session loaded", bidder)
+		  return
+		end
+		-- If we're manually editing the SRs, treat it like being locked for incoming additions
+		local softReservesLocked = softReservesLocked or SrEditFrame:IsVisible()
+		if TableLength(commandlist) == 1 or softReservesLocked then
+		  -- skip, query do the query at the end
+		elseif commandlist[2] == "clear" or commandlist[2] == "delete" or commandlist[2] == "remove" then
+		  Srs(softReserveSessionName)[bidder] = nil
+		elseif item ~= nil then
+		  local _i
+		  for _,_i in pairs(items) do
+			HandleSrAdd(bidder, ParseItemNameFromItemLink(_i))
+		  end
+		else
+		  table.remove(commandlist, 1)
+		  HandleSrAdd(bidder, table.concat(commandlist, " "))
+		end
+        HandleSrQuery(bidder)
+    -- Ignore all other whispers unless there is an active loot session and there is an item link in the whisper
+    elseif session ~= nil and item ~= nil then
+        local itemSession = session[item]
+        if itemSession == nil then
+            local invalidBid = "There is no active loot session for " .. item
+            SendResponse(invalidBid, bidder)
+            return
+        end
+        if not IsInRaid(arg2) then
+            local invalidBid = "You must be in the raid to send a bid on " .. item
+            SendResponse(invalidBid, bidder)
+            return
+        end
+
+        local mainSpec = itemSession["ms"]
+        local offSpec = itemSession["os"]
+        local twinkSpec = itemSession["twink"]
+        local roll = itemSession["roll"]
+        local cancel = itemSession["cancel"]
+        local notes = itemSession["notes"]
+        local real = itemSession["real"]
+		local minimumBid = itemSession['minBid'] ~= nil and tonumber(itemSession['minBid']) or ChatLootBidder_Store.MinBid
+        local bid = SplitBySpace(string.sub(arg1, itemIndexEnd + 1))
+        local tier = bid[1] and string.lower(bid[1]) or nil
+        local amt = bid[2] and string.lower(bid[2]) or nil
+        
+        if IsValidTier(tier) then
+            amt = ToWholeNumber(amt)
+        elseif IsValidTier(amt) then
+            -- The bidder mixed up the ms ## to ## ms, handle the mixup
+            local oldTier = tier
+            tier = amt;
+            amt = ToWholeNumber(oldTier)
+        else
+            SendResponse(InvalidBidSyntax(item), bidder)
+            return
+        end
+
+        if tier == "cancel" then
+          local cancelBid = "Bid canceled for " .. item
+          cancel[bidder] = true
+          mainSpec[bidder] = nil
+          offSpec[bidder] = nil
+          twinkSpec[bidder] = nil
+          notes[bidder] = nil
+          real[bidder] = nil
+          MessageBidChannel("<" .. PlayerWithClassColor(bidder) .. "> " .. cancelBid)
+          SendResponse(cancelBid, bidder)
+          return
+        end
+
+        -- Получаем текущий DKP игрока (только для DKP режима)
+        local playerDkp = nil
+        if sessionMode == "DKP" and (tier == "ms" or tier == "os" or tier == "twink") then
+            playerDkp = ChatLootBidder:GetPlayerDkpFromGuildNotes(bidder)
+            if not playerDkp then
+                SendResponse("Could not find your DKP balance in guild notes", bidder)
+                return
+            end
+        end
+
+        -- Проверяем и корректируем ставку в зависимости от типа
+        if sessionMode == "DKP" then
+            if tier == "ms" then
+                -- MS: от 0 до полного DKP баланса
+                amt = math.min(amt, playerDkp)
+                if amt < minimumBid then
+                    SendResponse("Your bid ("..amt..") is below minimum bid ("..minimumBid..")", bidder)
+                    return
+                end
+            elseif tier == "os" then
+                -- OS: максимум 50% от DKP баланса
+                local maxOsBid = math.ceil(playerDkp * (ChatLootBidder_Store.MaxOsBid/100))
+                amt = math.min(amt, maxOsBid)
+                if amt < 1 then
+                    SendResponse("You don't have enough DKP for offspec bid (minimum 1 DKP)", bidder)
+                    return
+                end
+            elseif tier == "twink" then
+                -- TWINK: максимум 30% от DKP баланса
+                local maxTwinkBid = math.ceil(playerDkp * (ChatLootBidder_Store.MaxTwinkBid/100))
+                amt = math.min(amt, maxTwinkBid)
+                if amt < 1 then
+                    SendResponse("You don't have enough DKP for twink bid (minimum 1 DKP)", bidder)
+                    return
+                end
+            end
+        end
+
+        if amt > ChatLootBidder_Store.MaxBid then
+            local invalidBid = "Bid for " .. item .. " is too large, the maximum accepted bid is: " .. ChatLootBidder_Store.MaxBid
+            SendResponse(invalidBid, bidder)
+            return
+        end
+
+        -- If they had previously canceled, remove them and allow the new bid to continue
+        cancel[bidder] = nil
+        if tier == "roll" then
+          if roll[bidder] ~= nil and roll[bidder] ~= -1 then
+            SendResponse("Your roll of " .. roll[bidder] .. " has already been recorded", bidder)
+            return
+          end
+        elseif sessionMode == "DKP" then
+          if amt < minimumBid then
+            SendResponse(InvalidBidSyntax(item), bidder)
+            return
+          end
+          -- remove amount from the table for note concat
+          table.remove(bid, 2)
+        else
+          amt = 1
+        end
+        -- remove tier from the table for note concat
+        table.remove(bid, 1)
+        local note = table.concat(bid, " ")
+        local alt = string.find(string.lower(note), "alt") ~= nil
+        real[bidder] = amt
+        -- if sessionMode == "DKP" and ChatLootBidder_Store.AltPenalty > 0 and alt then
+          -- Trace("Alt penalty is " .. ChatLootBidder_Store.AltPenalty .. "%")
+          -- amt = (amt * 100 - amt * ChatLootBidder_Store.AltPenalty) / 100
+        -- end
+        notes[bidder] = note
+        local received
+        if tier == "ms" then
+          mainSpec[bidder] = amt
+          if sessionMode == "MSOS" then roll[bidder] = roll[bidder] or -1 end
+          received = "Main Spec bid" .. of(amt, real[bidder]) .. " received for " .. item .. AppendNote(note)
+        elseif mainSpec[bidder] ~= nil then
+          SendResponse("You already have a MS bid" .. of(mainSpec[bidder], real[bidder]) .. " recorded. Use '[item-link] cancel' to cancel your current MS bid.", bidder)
+          return
+        elseif tier == "os" then
+          offSpec[bidder] = amt
+          if sessionMode == "MSOS" then roll[bidder] = roll[bidder] or -1 end
+          received = "Off Spec bid" .. of(amt, real[bidder]) .. " received for " .. item .. AppendNote(note)
+        elseif offSpec[bidder] ~= nil then
+          SendResponse("You already have an OS bid" .. of(offSpec[bidder], real[bidder]) .. " recorded. Use '[item-link] cancel' to cancel your current MS bid.", bidder)
+          return
+        elseif tier == "twink" then
+          twinkSpec[bidder] = amt
+          if sessionMode == "MSOS" then roll[bidder] = roll[bidder] or -1 end
+          received = "Twink bid" .. of(amt, real[bidder]) .. " received for " .. item .. AppendNote(note)
+        elseif twinkSpec[bidder] ~= nil then
+          SendResponse("You already have a Twink bid" .. of(twinkSpec[bidder], real[bidder]) .. " recorded. Use '[item-link] cancel' to cancel your current MS bid.", bidder)
+          return
+        elseif tier == "roll" then
+          roll[bidder] = -1
+          received = "Your roll bid for " .. item .. " has been received" .. AppendNote(note) .. ".  '/random' now to record your own roll or do nothing for the addon to roll for you at the end of the session."
+        end
+        MessageBidChannel("<" .. PlayerWithClassColor(bidder) .. "> " .. tier .. ((sessionMode == "MSOS" or amt == nil or tier == "roll") and "" or (" " .. realAmt(amt, real[bidder]))) .. " " .. item)
+        SendResponse(received, bidder)
         return
-      end
-      -- remove amount from the table for note concat
-      table.remove(bid, 2)
+
     else
-      amt = 1
+        ChatLootBidder_ChatFrame_OnEvent(event)
     end
-    -- remove tier from the table for note concat
-    table.remove(bid, 1)
-    local note = table.concat(bid, " ")
-    local alt = string.find(string.lower(note), "alt") ~= nil
-    real[bidder] = amt
-    if sessionMode == "DKP" and ChatLootBidder_Store.AltPenalty > 0 and alt then
-      Trace("Alt penalty is " .. ChatLootBidder_Store.AltPenalty .. "%")
-      amt = (amt * 100 - amt * ChatLootBidder_Store.AltPenalty) / 100
-    end
-    notes[bidder] = note
-    local received
-    if tier == "ms" then
-      mainSpec[bidder] = amt
-      if sessionMode == "MSOS" then roll[bidder] = roll[bidder] or -1 end
-      received = "Main Spec bid" .. of(amt, real[bidder]) .. " received for " .. item .. AppendNote(note)
-    elseif mainSpec[bidder] ~= nil then
-      SendResponse("You already have a MS bid" .. of(mainSpec[bidder], real[bidder]) .. " recorded. Use '[item-link] cancel' to cancel your current MS bid.", bidder)
-      return
-    elseif tier == "os" then
-      offSpec[bidder] = amt
-      if sessionMode == "MSOS" then roll[bidder] = roll[bidder] or -1 end
-      received = "Off Spec bid" .. of(amt, real[bidder]) .. " received for " .. item .. AppendNote(note)
-    elseif offSpec[bidder] ~= nil then
-      SendResponse("You already have an OS bid" .. of(offSpec[bidder], real[bidder]) .. " recorded. Use '[item-link] cancel' to cancel your current MS bid.", bidder)
-      return
-    elseif tier == "roll" then
-      roll[bidder] = -1
-      received = "Your roll bid for " .. item .. " has been received" .. AppendNote(note) .. ".  '/random' now to record your own roll or do nothing for the addon to roll for you at the end of the session."
-    end
-    MessageBidChannel("<" .. PlayerWithClassColor(bidder) .. "> " .. tier .. ((sessionMode == "MSOS" or amt == nil or tier == "roll") and "" or (" " .. realAmt(amt, real[bidder]))) .. " " .. item)
-    SendResponse(received, bidder)
-    return
-  else
-    ChatLootBidder_ChatFrame_OnEvent(event)
-  end
 end
 
 function ChatLootBidder:StartSessionButtonShown()
@@ -1124,9 +1508,9 @@ end
 function ChatLootBidder:EndSessionButtonShown()
   ChatLootBidder:Show()
   startSessionButton:Hide()
-  clearSessionButton:Hide()
+  -- clearSessionButton:Hide()
   endSessionButton:Show()
-  ChatLootBidder:SetHeight(50)
+  -- ChatLootBidder:SetHeight(50)
   for i = 1, 8 do
     local stageItem = getglobal(ChatLootBidder:GetName() .. "Item"..i)
     local unstageButton = getglobal(ChatLootBidder:GetName() .. "UnstageButton"..i)
@@ -1211,9 +1595,61 @@ function ChatLootBidder.ADDON_LOADED()
 end
 
 function ChatLootBidder.CHAT_MSG_ADDON(addonTag, stringMessage, channel, sender)
-  if VersionUtil:CHAT_MSG_ADDON(addonName, function(ver)
-    Message("New version " .. ver .. " of " .. addonTitle .. " is available! Upgrade now at " .. addonNotes)
-  end) then return end
+    if VersionUtil:CHAT_MSG_ADDON(addonName, function(ver)
+        Message("New version " .. ver .. " of " .. addonTitle .. " is available! Upgrade now at " .. addonNotes)
+    end) then 
+        return 
+    end
+    if addonTag == addonName and sender ~= me and IsInRaid(sender) and IsRaidAssistant(sender) and IsRaidAssistant(me) and ChatLootBidder_Store.ListenLootHistory then
+        Debug('GOTCHA '..stringMessage..' from '..sender)
+        
+        -- Парсим сообщение о луте
+        local success, record = pcall(function()
+            local parts = {}
+            for part in gfind(stringMessage, "([^,]+)") do
+                table.insert(parts, Trim(part))
+            end
+            
+            if getn(parts) >= 6 then
+                return {
+                    character = parts[1],
+                    item = parts[2],
+                    bid_type = parts[3],
+                    bid_amount = parts[4] ~= "" and tonumber(parts[4]) or nil,
+                    boss = parts[5],
+                    datetime = parts[6]
+                }
+            end
+            return nil
+        end)
+        
+        if success and record and record.character and record.item then
+            local isDuplicate = false
+            for _, existing in ipairs(ChatLootBidder_LootHistory) do
+                if existing.character == record.character and 
+                   existing.item == record.item and 
+                   existing.datetime == record.datetime then
+                    isDuplicate = true
+                    break
+                end
+            end
+            
+            if not isDuplicate then
+                table.insert(ChatLootBidder_LootHistory, record)
+                Debug(string.format("Added loot record from %s: %s won %s (%s)", 
+                    sender, record.character, record.item, record.bid_type))
+                
+                -- Обновляем UI если окно истории открыто
+                if SrEditFrame:IsVisible() and SrEditFrameHeaderString:GetText() == 'LootHistory' then
+                    ChatLootBidder:HandleShowLootHistory()
+                end
+            else
+                Debug("Duplicate loot record ignored")
+            end
+        elseif not success then
+            Debug("Failed to parse loot message: "..tostring(record))
+        end
+    end
 end
 
 function ChatLootBidder.PARTY_MEMBERS_CHANGED()
@@ -1303,22 +1739,122 @@ function ChatLootBidder:DecodeAndSave(text, parent)
   local encoding = SrEditFrameHeaderString:GetText()
   local t
   if encoding == "json" then
-    t = json.decode(text)
+	t = json.decode(text)
   elseif encoding == "csv" then
-    t = UnFlatten(csv:fromCSV(text))
+	t = UnFlatten(csv:fromCSV(text))
   elseif encoding == "raidresfly" then
-    t = ParseRaidResFly(text)
+	t = ParseRaidResFly(text)
   elseif encoding == "semicolon" then
-    t = ParseSemicolon(text)
+	t = ParseSemicolon(text)
   else
-    Error("No encoding provided")
-    return
+	Error("No encoding provided")
+	return
   end
   ValidateFixAndWarn(t)
   ChatLootBidder_Store.SoftReserveSessions[softReserveSessionName] = t
   ChatLootBidderOptionsFrame_Reload()
   parent:Hide()
 end
+
+function ChatLootBidder:DecodeLootHistoryAndSave(text, parent)
+  Debug('Trying to save loothistory...')
+  local t = UnflattenLootHistory(csv:fromCSV(text))
+  -- Make checking data here
+  ChatLootBidder_LootHistory = t
+  ChatLootBidder:PrintLootHistory()
+  ChatLootBidderOptionsFrame_Reload()
+  parent:Hide()
+end
+
+
+function ChatLootBidder:DecodeImportDkpAndSave(text, parent)
+    Debug('Starting DKP import...')
+    
+    local csvData = csv:fromCSV(text)
+    if not csvData or getn(csvData) == 0 then
+        Error("Invalid or empty CSV data")
+        parent:Hide()
+        return
+    end
+
+    local raidLookup = {}
+    if IsInRaid(me) then
+        for i = 1, GetNumRaidMembers() do
+            local name = GetRaidRosterInfo(i)
+            if name then
+                raidLookup[ChatLootBidder:CapitalizeStr(name)] = true
+            end
+        end
+    else
+        Error("You must be in a raid to import DKP")
+        parent:Hide()
+        return
+    end
+
+    local importData = {}
+    for _, row in ipairs(csvData) do
+        if getn(row) >= 2 then
+            local name = ChatLootBidder:CapitalizeStr(row[1])
+            if raidLookup[name] then
+                importData[name] = {
+                    dkp = tonumber(row[2]) or 0,
+                    isMain = (getn(row) >= 3) and (tonumber(row[3]) or 0)
+                }
+            end
+        end
+    end
+
+    local memberCount = GetNumGuildMembers()
+    local processed = 0
+    local skipped = 0
+
+    for i = 1, memberCount do
+        local name, _, _, _, _, _, publicNote = GetGuildRosterInfo(i)
+        name = name and ChatLootBidder:CapitalizeStr(name)
+
+        if name and importData[name] then
+            local newDkp = importData[name].dkp
+            local newNote = publicNote or ""
+			local dkpPattern = "<(-?%d+)>"
+            if newNote then
+                if string.find(newNote, dkpPattern) then
+					newNote = string.gsub(newNote, dkpPattern, ChatLootBidder:CreateDkpString(newDkp), 1)
+                else
+                    newNote = newNote..ChatLootBidder:CreateDkpString(newDkp)
+                end
+            else
+				newNote = newNote..(newNote ~= "" and " " or "")..ChatLootBidder:CreateDkpString(newDkp)
+            end
+            GuildRosterSetPublicNote(i, newNote)
+            processed = processed + 1
+            Debug(string.format("Set DKP for %s to %d", name, newDkp))
+        end
+    end
+
+    for name, _ in pairs(importData) do
+        if not string.find(name, ",") then
+            local found = false
+            for i = 1, memberCount do
+                local guildName = GetGuildRosterInfo(i)
+                if guildName and ChatLootBidder:CapitalizeStr(guildName) == name then
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                skipped = skipped + 1
+                Debug(string.format("%s not found in guild", name))
+            end
+        end
+    end
+
+    GuildRoster()
+    Message(string.format("DKP import complete: %d updated, %d not in guild", 
+        processed, skipped))
+    
+    parent:Hide()
+end
+
 
 --
 -- Taken from https://github.com/laytya/WowLuaVanilla which took it from SuperMacro
@@ -1346,4 +1882,207 @@ function ChatLootBidder:OnVerticalScroll(scrollFrame)
 	else
 		scrollbar:Hide();
 	end
+end
+
+-- Функция для вывода истории лута в чат
+function ChatLootBidder:PrintLootHistory()
+    if getn(ChatLootBidder_LootHistory) == 0 then
+        Message("Loot history is empty")
+        return
+    end
+    
+    Message("=== Loot History ===")
+    for i=1,getn(ChatLootBidder_LootHistory) do
+        local record = ChatLootBidder_LootHistory[i]
+        local line = string.format("%s, %s, %s%s%s",
+            record.character,
+            record.item,
+            record.bid_type,
+            record.bid_amount ~= nil and (", " .. record.bid_amount) or ",",
+            record.boss ~= nil and (", " .. record.boss) or ",",
+            record.datetime ~= nil and (", " .. record.datetime) or ",")
+        Message(line)
+    end
+end
+
+function ChatLootBidder:ClearLootHistory()
+    ChatLootBidder_LootHistory = {}
+    Message("Loot history cleared")
+end
+
+function ChatLootBidder:SetDKP(playername, dkpValue, silentmode)
+    if not playername or type(playername) ~= "string" or playername == "" then
+        if not silentmode then
+            Error("Invalid player name")
+        end
+        return false
+    end
+    
+    dkpValue = dkpValue or 0
+    playername = ChatLootBidder:CapitalizeStr(playername)
+    
+    Debug("Setting DKP for "..playername..": "..dkpValue)
+    
+    local memberCount = GetNumGuildMembers()
+    for i = 1, memberCount do
+        local name, _, _, _, _, _, publicNote = GetGuildRosterInfo(i)
+        if name == playername then
+            Debug("Found player in guild roster")
+            local newNote = publicNote or ""
+            local currentDKP = 0
+            local dkpPattern = "<(-?%d+)>"
+            
+            local startPos, endPos, dkpStr = string.find(newNote, dkpPattern)
+            
+            if dkpStr and tonumber(dkpStr) then
+                currentDKP = tonumber(dkpStr)
+                Debug("Current DKP found: "..currentDKP.." and reseting...")
+                newNote = string.gsub(newNote, dkpPattern, ChatLootBidder:CreateDkpString(dkpValue), 1)
+            else
+                Debug("No DKP record found, creating new one")
+                newNote = newNote..(newNote ~= "" and " " or "")..ChatLootBidder:CreateDkpString(dkpValue)
+            end
+            
+            Debug("New note: "..newNote)
+            
+            GuildRosterSetPublicNote(i, newNote)
+            
+            if not silentmode then
+                Message(string.format("Updated DKP for %s: %+d (Total: %d)", 
+                    playername, dkpValue, currentDKP + dkpValue))
+            end
+            
+            return true
+        end
+    end
+    
+    if not silentmode then
+        Message(string.format("%s was not found in the guild; DKP was not updated.", playername))
+    end
+    return false
+end
+
+
+function ChatLootBidder:ApplyDKP(playername, dkpValue, silentmode)
+    if not playername or type(playername) ~= "string" or playername == "" then
+        if not silentmode then
+            Error("Invalid player name")
+        end
+        return false
+    end
+    
+    dkpValue = dkpValue or 0
+    playername = ChatLootBidder:CapitalizeStr(playername)
+    
+    Debug("Applying DKP for "..playername..": "..dkpValue)
+    
+    local memberCount = GetNumGuildMembers()
+    for i = 1, memberCount do
+        local name, _, _, _, _, _, publicNote = GetGuildRosterInfo(i)
+        if name == playername then
+            Debug("Found player in guild roster")
+            local newNote = publicNote or ""
+            local currentDKP = 0
+            local dkpPattern = "<(-?%d+)>"
+            
+            local startPos, endPos, dkpStr = string.find(newNote, dkpPattern)
+            
+            if dkpStr and tonumber(dkpStr) then
+                currentDKP = tonumber(dkpStr)
+                Debug("Current DKP found: "..currentDKP)
+                newNote = string.gsub(newNote, dkpPattern, ChatLootBidder:CreateDkpString(currentDKP + dkpValue), 1)
+            else
+                Debug("No DKP record found, creating new one")
+                newNote = newNote..(newNote ~= "" and " " or "")..ChatLootBidder:CreateDkpString(dkpValue)
+            end
+            
+            Debug("New note: "..newNote)
+            
+            GuildRosterSetPublicNote(i, newNote)
+            
+            if not silentmode then
+                Message(string.format("Updated DKP for %s: %+d (Total: %d)", 
+                    playername, dkpValue, currentDKP + dkpValue))
+            end
+            
+            return true
+        end
+    end
+    
+    if not silentmode then
+        Message(string.format("%s was not found in the guild; DKP was not updated.", playername))
+    end
+    return false
+end
+
+
+function ChatLootBidder:GetPlayerDkpFromGuildNotes(playerName)
+    local memberCount = GetNumGuildMembers()
+    for i = 1, memberCount do
+        local name, _, _, _, _, _, publicNote = GetGuildRosterInfo(i)
+        if name and ChatLootBidder:CapitalizeStr(name) == ChatLootBidder:CapitalizeStr(playerName) then
+            local _, _, dkp = string.find(publicNote or "", "<(-?%d+)>")
+            return tonumber(dkp) or 0
+        end
+    end
+    return nil
+end
+
+
+function ChatLootBidder:UpdatePlayerDkpInGuildNotes(playerName, newDkp)
+    local memberCount = GetNumGuildMembers()
+    for i = 1, memberCount do
+        local name, _, _, _, _, _, publicNote = GetGuildRosterInfo(i)
+        if name and ChatLootBidder:CapitalizeStr(name) == ChatLootBidder:CapitalizeStr(playerName) then
+            local newNote = publicNote or ""
+			local dkpPattern = "<(-?%d+)>"
+            if newNote then
+                if string.find(publicNote, dkpPattern) then
+					newNote = string.gsub(newNote, dkpPattern, ChatLootBidder:CreateDkpString(newDkp), 1)
+                else
+                    newNote = publicNote..ChatLootBidder:CreateDkpString(newDkp)
+                end
+            else
+				newNote = newNote..(newNote ~= "" and " " or "")..ChatLootBidder:CreateDkpString(newDkp)
+            end
+            Debug("New note: "..newNote)
+            
+            GuildRosterSetPublicNote(i, newNote)
+            return true
+        end
+    end
+    return false
+end
+
+
+function ChatLootBidder:CreateDkpString(dkp)
+	local result;
+	if not dkp or dkp == "" or not tonumber(dkp) then
+		dkp = 0;
+	end
+	dkp = tonumber(dkp);
+	local dkpLen = 5;
+	if dkpLen > 0 then
+		local dkpStr = "".. abs(dkp)
+		while string.len(dkpStr) < dkpLen do
+			dkpStr = "0"..dkpStr;
+		end
+		if dkp < 0 then
+			dkpStr = "-"..dkpStr;
+		end				
+		result = "<"..dkpStr..">";
+	else
+		result = "<"..dkp..">";
+	end
+	return result;
+end
+
+function ChatLootBidder:CapitalizeStr(msg)
+	if not msg then
+		return ""
+	end	
+
+	local f = string.sub(msg, 1, 1)
+	local r = string.sub(msg, 2)
+	return string.upper(f) .. string.lower(r)
 end

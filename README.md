@@ -1,3 +1,6 @@
+# ATTENTION! THIS IS MOD FOR THE GUILD "CuHuu TpakTop". USE AT YOUR OWN RISK! (IF YOU WANT PURE VERSION OF ChatLootBidder CHECK [MAIN REPO](https://github.com/trumpetx/ChatLootBidder))
+
+
 # Overview and Goals
 This addon's primary goal is to manage the process of bidding and rolling on items in a Master Looter environment in a semi-automated way.  This addon is for Master Looters.  If you are a bidder/raider, you should check out the [NotChatLootBidder](https://github.com/trumpetx/NotChatLootBidder) addon.
 

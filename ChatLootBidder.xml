@@ -312,6 +312,7 @@
         </Scripts>
       </Button>
       <Button name="$parentCloseButton" inherits="UIPanelCloseButton" text="">
+	  
         <Size>
           <AbsDimension x="28" y="28"/>
         </Size>
@@ -328,7 +329,8 @@
           </OnClick>
         </Scripts>
       </Button>
-    </Frames>
+	  
+	</Frames>
     <Scripts>
       <OnEvent>
         this[event](arg1,arg2,arg3,arg4)

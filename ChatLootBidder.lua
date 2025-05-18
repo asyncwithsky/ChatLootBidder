@@ -1683,10 +1683,7 @@ end
 function ChatLootBidder.PLAYER_TARGET_CHANGED()
 	local unitid
 	local isBoss = UnitLevel("target") == -1
-	if UnitIsPlayer("target") or UnitPlayerControlled("target") and UnitLevel("target") and isBoss then
-		unitid = "targettarget"
-		bossName = UnitName(unitid)
-	elseif isBoss then
+	if isBoss then
 		unitid = "target"
 		bossName = UnitName(unitid)
 	end

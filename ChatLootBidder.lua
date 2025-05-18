@@ -35,6 +35,18 @@ local session = nil
 local sessionMode = nil
 local stage = {}
 local lastWhisper = nil
+local bossName = nil
+local bosses = {
+	["Highlord Mograine"] = "The Four Horsemen",
+	["Thane Korth'azz"] = "The Four Horsemen",
+	["Sir Zeliek"] = "The Four Horsemen",
+	["Lady Blaumeux"] = "The Four Horsemen",
+	["Princess Yauj"] = "Bug Trio",
+	["Vem"] = "Bug Trio",
+	["Lord Kri"] = "Bug Trio",
+	["Emperor Vek'lor"] = "Twin Emperors",
+	["Emperor Vek'nilash"] = "Twin Emperors",
+}
 
 local function DefaultFalse(prop) return prop == true end
 local function DefaultTrue(prop) return prop == nil or DefaultFalse(prop) end
@@ -377,7 +389,7 @@ end
 
 local function PlayerWithClassColor(unit)
   -- if RAID_CLASS_COLORS and pfUI then -- pfUI loads class colors
-  if RAID_CLASS_COLORS then -- pfUI loads class colors
+  if RAID_CLASS_COLORS then
     local unitClass = GetPlayerClass(unit)
     local colorStr = RAID_CLASS_COLORS[unitClass].colorStr
     if colorStr and string.len(colorStr) == 8 then
@@ -425,12 +437,11 @@ local function realAmt(amt, real)
   return amt
 end
 
-local function AddToLootHistory(winner, item, bidType, bidAmount, bossName)
+local function AddToLootHistory(winner, item, bidType, bidAmount)
     -- Получаем текущую дату и время в формате HH:MM:SS DD/MM/YY
     local time = date("%H:%M:%S")
     local dateStr = date("%d/%m/%y")
     local datetime = time .. " " .. dateStr
-    
     bossName = bossName or ""
     
     local record = {
@@ -697,14 +708,8 @@ local function BidSummary(announceWinners)
             for _, winner in ipairs(winners) do
                 local bidType = (winningTier == "ms" or winningTier == "os" or winningTier == "twink") and "dkp" or winningTier
                 local bidAmount = (bidType == "dkp") and winningBid or nil
-                local bossName = ''
                 
-                if ChatLootBidder:MasterLootRemindLoaded() and MasterLootRemind._bossName ~= '_NONE_' then
-                    bossName = MasterLootRemind._bossName
-                    Debug('MasterLootRemind loaded, last boss name is '..bossName)
-                end
-                
-                AddToLootHistory(winner, item, bidType, bidAmount, bossName)
+                AddToLootHistory(winner, item, bidType, bidAmount)
             end
         end
         
@@ -750,34 +755,45 @@ local function GetItemLinks(str)
 end
 
 function ChatLootBidder:Start(items, minBid, mode)
-    if not IsRaidAssistant(me) then Error("You must be a raid leader or assistant in a raid to start a loot session"); return end
-    if not IsMasterLooterSet() then Error("Master Looter must be set to start a loot session"); return end
+    if not IsRaidAssistant(me) then 
+        Error("You must be a raid leader or assistant in a raid to start a loot session") 
+        return 
+    end
     
     local mode = mode ~= nil and mode or ChatLootBidder_Store.DefaultSessionMode
     if session ~= nil then ChatLootBidder:End() end
 
+    local currentItem = nil
+    
 	if getn(stage) == 0 then
 		ChatLootBidder:SetHeight(100)
 	end
-	
-    local stagedItem = nil
-    for k, v in pairs(stage) do
-        if v == true then
-            stagedItem = k
-            stage[k] = nil
-            break
+    if items and getn(items) > 0 then
+        currentItem = items[1]
+        
+        stage[currentItem] = nil
+        
+        for i = 2, getn(items) do
+            stage[items[i]] = true
+        end
+    else
+        for k, v in pairs(stage) do
+            if v == true then
+                currentItem = k
+                stage[k] = nil
+                break
+            end
         end
     end
     
-    if items == nil then
-        items = stagedItem and {stagedItem} or {}
-    elseif stagedItem then
-        table.insert(items, 1, stagedItem)
+    if not currentItem then 
+        Error("You must provide at least a single item to bid on") 
+        return 
     end
     
-    if IsTableEmpty(items) then Error("You must provide at least a single item to bid on"); return end
     ChatLootBidder:RedrawStage()
     ChatLootBidder:EndSessionButtonShown()
+    
     session = {}
     sessionMode = mode
     
@@ -787,65 +803,56 @@ function ChatLootBidder:Start(items, minBid, mode)
     end
     
     local srs = mode == "MSOS" and softReserveSessionName ~= nil and ChatLootBidder_Store.SoftReserveSessions[softReserveSessionName] or {}
-    local startChannelMessage = {}
-    table.insert(startChannelMessage, "Bid on the following items")
-    table.insert(startChannelMessage, "-----------")
+    local startChannelMessage = {
+        "Bid on the following items",
+        "-----------",
+        currentItem
+    }
     
     local minimumBid = (minBid ~= nil and tostring(minBid)) or tostring(ChatLootBidder_Store.MinBid)
-    local bidAddonMessage = "mode=" .. mode ..",minimumBid="..minimumBid..",MaxOsBid=".. tostring(ChatLootBidder_Store.MaxOsBid)..",MaxTwinkBid=".. tostring(ChatLootBidder_Store.MaxTwinkBid)..",items="
-    local exampleItem
+    local bidAddonMessage = "mode="..mode..",minimumBid="..minimumBid..",MaxOsBid="..tostring(ChatLootBidder_Store.MaxOsBid)..",MaxTwinkBid="..tostring(ChatLootBidder_Store.MaxTwinkBid)..",items="..string.gsub(currentItem, ",", "~~~")
     
-    for k, i in pairs(items) do
-        local itemName = ParseItemNameFromItemLink(i)
-        local srsOnItem = GetKeysWhere(srs, function(player, playerSrs) return IsInRaid(player) and TableContains(playerSrs, itemName) end)
-        local srLen = TableLength(srsOnItem)
+    local itemName = ParseItemNameFromItemLink(currentItem)
+    local srsOnItem = GetKeysWhere(srs, function(player, playerSrs) return IsInRaid(player) and TableContains(playerSrs, itemName) end)
+    local srLen = TableLength(srsOnItem)
+    
+    session[currentItem] = {
+        cancel = {},
+        roll = {},
+        real = {},
+        minBid = minimumBid,
+        notes = {},
+        ms = {},
+        os = {},
+        twink = {}
+    }
+    
+    if srLen > 0 then
+        startChannelMessage[3] = currentItem .. " SR (" .. srLen .. ")"
+        session[currentItem].sr = {}
         
-        session[i] = {
-            cancel = {},
-            roll = {},
-            real = {},
-            minBid = minimumBid,
-            notes = {}
-        }
-        
-        if srLen == 0 then
-            exampleItem = i
-            table.insert(startChannelMessage, i)
-            bidAddonMessage = bidAddonMessage .. string.gsub(i, ",", "~~~")
-            session[i]["ms"] = {}
-            session[i]["os"] = {}
-            session[i]["twink"] = {}
-        else
-            table.insert(startChannelMessage, i .. " SR (" .. srLen .. ")")
-            session[i]["sr"] = {}
-            for _, sr in pairs(srsOnItem) do
-                session[i]["sr"][sr] = 1
-                session[i]["roll"][sr] = -1
-                if srLen > 1 then
-                    SendResponse("Your Soft Reserve for " .. i .. " is contested by " .. (srLen-1) .. " other player" .. (srLen == 2 and "" or "s") .. ". '/random' now to record your own roll or do nothing for the addon to roll for you at the end of the session.", sr)
-                else
-                    SendResponse("You won " .. i .. " with your Soft Reserve!", srsOnItem[1])
-                end
+        for _, sr in pairs(srsOnItem) do
+            session[currentItem].sr[sr] = 1
+            session[currentItem].roll[sr] = -1
+            if srLen > 1 then
+                SendResponse("Your Soft Reserve for " .. currentItem .. " is contested by " .. (srLen-1) .. " other player" .. (srLen == 2 and "" or "s") .. ". '/random' now to record your own roll or do nothing for the addon to roll for you at the end of the session.", sr)
+            else
+                SendResponse("You won " .. currentItem .. " with your Soft Reserve!", srsOnItem[1])
             end
         end
     end
     
     table.insert(startChannelMessage, "-----------")
+    table.insert(startChannelMessage, "/w " .. PlayerWithClassColor(me) .. " " .. currentItem .. " ms/os/twink/roll" .. (mode == "DKP" and " #bid (minBid: "..minimumBid..")" or "") .. " [optional-note]")
     
-    if exampleItem then
-        table.insert(startChannelMessage, "/w " .. PlayerWithClassColor(me) .. " " .. exampleItem .. " ms/os/twink/roll" .. (mode == "DKP" and " #bid (minBid: "..minimumBid..")" or "") .. " [optional-note]")
-        
-        for _, l in pairs(startChannelMessage) do
-            MessageStartChannel(l)
-        end
-        
-        timer = ChatLootBidder_Store.TimerSeconds
-        if BigWigs and timer > 0 then BWCB(timer, "Bidding Ends") end
-        ChatThrottleLib:SendAddonMessage("BULK", "NotChatLootBidder", bidAddonMessage, "RAID")
-    else
-        -- Everything was SR'd - just end now
-        ChatLootBidder:End()
+    for _, l in pairs(startChannelMessage) do
+        MessageStartChannel(l)
     end
+    
+    timer = ChatLootBidder_Store.TimerSeconds
+    if BigWigs and timer > 0 then BWCB(timer, "Bidding Ends") end
+    
+    ChatThrottleLib:SendAddonMessage("BULK", "NotChatLootBidder", bidAddonMessage, "RAID")
 end
 
 function ChatLootBidder:Clear(stageOnly)
@@ -1252,10 +1259,6 @@ local function AtlasLootLoaded()
   return (AtlasLoot_Data and AtlasLoot_Data["AtlasLootItems"]) ~= nil
 end
 
-function ChatLootBidder:MasterLootRemindLoaded()
-  return (MasterLootRemind and MasterLootRemind._bossName) ~= nil
-end
-
 -- Ex/
 -- AtlasLoot_Data["AtlasLootItems"]["BWLRazorgore"][1]
 -- { 16925, "INV_Belt_22", "=q4=Belt of Transcendence", "=ds=#s10#, #a1# =q9=#c5#", "11%" }
@@ -1411,15 +1414,15 @@ function ChatFrame_OnEvent(event)
             elseif tier == "os" then
                 local maxOsBid = math.ceil(playerDkp * (ChatLootBidder_Store.MaxOsBid/100))
                 amt = math.min(amt, maxOsBid)
-                if amt < 1 then
-                    SendResponse("You don't have enough DKP for offspec bid (minimum 1 DKP)", bidder)
+                if amt < minimumBid then
+                    SendResponse("Your bid ("..amt..") is below minimum bid ("..minimumBid..")", bidder)
                     return
                 end
             elseif tier == "twink" then
                 local maxTwinkBid = math.ceil(playerDkp * (ChatLootBidder_Store.MaxTwinkBid/100))
                 amt = math.min(amt, maxTwinkBid)
-                if amt < 1 then
-                    SendResponse("You don't have enough DKP for twink bid (minimum 1 DKP)", bidder)
+                if amt < minimumBid then
+                    SendResponse("Your bid ("..amt..") is below minimum bid ("..minimumBid..")", bidder)
                     return
                 end
             end
@@ -1664,7 +1667,8 @@ end
 function ChatLootBidder.LOOT_OPENED()
   if session ~= nil then return end
   if not ChatLootBidder_Store.AutoStage then return end
-  if not IsMasterLooterSet() or not IsRaidAssistant(me) then return end
+  -- if not IsMasterLooterSet() or not IsRaidAssistant(me) then return end
+  if not IsRaidAssistant(me) then return end
   local i
   for i=1, GetNumLootItems() do
     local lootIcon, lootName, lootQuantity, rarity, locked, isQuestItem, questId, isActive = GetLootSlotInfo(i)
@@ -1674,6 +1678,21 @@ function ChatLootBidder.LOOT_OPENED()
     end
   end
   ChatLootBidder:RedrawStage()
+end
+
+function ChatLootBidder.PLAYER_TARGET_CHANGED()
+	local unitid
+	local isBoss = UnitLevel("target") == -1
+	if UnitIsPlayer("target") or UnitPlayerControlled("target") and UnitLevel("target") and isBoss then
+		unitid = "targettarget"
+		bossName = UnitName(unitid)
+	elseif isBoss then
+		unitid = "target"
+		bossName = UnitName(unitid)
+	end
+	if bossName ~= nil and bosses[bossName] then
+		bossName = bosses[bossName]
+	end
 end
 
 

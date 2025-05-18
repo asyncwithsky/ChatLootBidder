@@ -342,6 +342,7 @@
         this:RegisterEvent("PLAYER_LEAVING_WORLD")
         this:RegisterEvent("CHAT_MSG_SYSTEM")
         this:RegisterEvent("LOOT_OPENED")
+		this:RegisterEvent("PLAYER_TARGET_CHANGED")
         this:RegisterForDrag("LeftButton")
       </OnLoad>
       <OnHide>
